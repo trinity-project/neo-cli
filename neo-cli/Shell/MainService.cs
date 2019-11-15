@@ -142,8 +142,7 @@ namespace Neo.Shell
             if (NoWallet()) return true;
             byte[] script = LoadDeploymentScript(
                 /* filePath */ args[1],
-                /* hasStorage */ args[2].ToBool(),
-                /* isPayable */ args[3].ToBool(),
+                /* manifest */ args.Length == 2 ? "" : args[2],
                 /* scriptHash */ out var scriptHash);
 
             Transaction tx;
@@ -191,7 +190,7 @@ namespace Neo.Shell
                 Console.WriteLine($"Invoking script with: '{tx.Script.ToHexString()}'");
             }
 
-            ApplicationEngine engine = ApplicationEngine.Run(tx.Script, tx);
+            ApplicationEngine engine = ApplicationEngine.Run(tx.Script, tx, testMode: true);
 
             Console.WriteLine($"VM State: {engine.State}");
             Console.WriteLine($"Gas Consumed: {engine.GasConsumed}");
@@ -212,16 +211,33 @@ namespace Neo.Shell
                 Console.WriteLine("Error: insufficient balance.");
                 return true;
             }
-            if (ReadUserInput("relay tx(no|yes)") != "yes")
+            if (!ReadUserInput("relay tx(no|yes)").IsYes())
             {
                 return true;
             }
             return SignAndSendTx(tx);
         }
 
-        private byte[] LoadDeploymentScript(string nefFilePath, bool hasStorage, bool isPayable, out UInt160 scriptHash)
+        private byte[] LoadDeploymentScript(string nefFilePath, string manifestFilePath, out UInt160 scriptHash)
         {
-            var info = new FileInfo(nefFilePath);
+            if (string.IsNullOrEmpty(manifestFilePath))
+            {
+                manifestFilePath = Path.ChangeExtension(nefFilePath, ".manifest.json");
+            }
+
+            // Read manifest
+
+            var info = new FileInfo(manifestFilePath);
+            if (!info.Exists || info.Length >= Transaction.MaxTransactionSize)
+            {
+                throw new ArgumentException(nameof(manifestFilePath));
+            }
+
+            var manifest = ContractManifest.Parse(File.ReadAllText(manifestFilePath));
+
+            // Read nef
+
+            info = new FileInfo(nefFilePath);
             if (!info.Exists || info.Length >= Transaction.MaxTransactionSize)
             {
                 throw new ArgumentException(nameof(nefFilePath));
@@ -232,14 +248,48 @@ namespace Neo.Shell
             {
                 file = stream.ReadSerializable<NefFile>();
             }
-            scriptHash = file.ScriptHash;
 
-            ContractFeatures properties = ContractFeatures.NoProperty;
-            if (hasStorage) properties |= ContractFeatures.HasStorage;
-            if (isPayable) properties |= ContractFeatures.Payable;
+            // Basic script checks
+
+            using (var engine = new ApplicationEngine(TriggerType.Application, null, null, 0, true))
+            {
+                var context = engine.LoadScript(file.Script);
+
+                while (context.InstructionPointer <= context.Script.Length)
+                {
+                    // Check bad opcodes
+
+                    var ci = context.CurrentInstruction;
+
+                    if (ci == null || !Enum.IsDefined(typeof(OpCode), ci.OpCode))
+                    {
+                        throw new FormatException($"OpCode not found at {context.InstructionPointer}-{((byte)ci.OpCode).ToString("x2")}");
+                    }
+
+                    switch (ci.OpCode)
+                    {
+                        case OpCode.SYSCALL:
+                            {
+                                // Check bad syscalls (NEO2)
+
+                                if (!InteropService.SupportedMethods().ContainsKey(ci.TokenU32))
+                                {
+                                    throw new FormatException($"Syscall not found {ci.TokenU32.ToString("x2")}. Are you using a NEO2 smartContract?");
+                                }
+                                break;
+                            }
+                    }
+
+                    context.InstructionPointer += ci.Size;
+                }
+            }
+
+            // Build script
+
+            scriptHash = file.ScriptHash;
             using (ScriptBuilder sb = new ScriptBuilder())
             {
-                sb.EmitSysCall(InteropService.Neo_Contract_Create, file.Script, properties);
+                sb.EmitSysCall(InteropService.Neo_Contract_Create, file.Script, manifest.ToJson().ToString());
                 return sb.ToArray();
             }
         }
@@ -385,11 +435,12 @@ namespace Neo.Shell
             }
 
             string path = "address.txt";
-
-            if (File.Exists(path) &&
-                ReadUserInput($"The file '{path}' already exists, do you want to overwrite it? (yes|no)", false)?.ToLowerInvariant() != "yes")
+            if (File.Exists(path))
             {
-                return true;
+                if (!ReadUserInput($"The file '{path}' already exists, do you want to overwrite it? (yes|no)", false).IsYes())
+                {
+                    return true;
+                }
             }
 
             ushort count;
@@ -429,10 +480,12 @@ namespace Neo.Shell
                 Console.WriteLine("error");
                 return true;
             }
-            if (system.RpcServer != null &&
-                ReadUserInput("Warning: Opening the wallet with RPC turned on could result in asset loss. Are you sure you want to do this? (yes|no)", false)?.ToLowerInvariant() != "yes")
+            if (system.RpcServer != null)
             {
-                return true;
+                if (!ReadUserInput("Warning: Opening the wallet with RPC turned on could result in asset loss. Are you sure you want to do this? (yes|no)", false).IsYes())
+                {
+                    return true;
+                }
             }
             string path = args[2];
             string password = ReadUserInput("password", true);
@@ -569,7 +622,7 @@ namespace Neo.Shell
                 "\tsend <id|alias> <address> <value>\n" +
                 "\tsign <jsonObjectToSign>\n" +
                 "Contract Commands:\n" +
-                "\tdeploy <nefFilePath> <hasStorage (true|false)> <isPayable (true|false)\n" +
+                "\tdeploy <nefFilePath> [manifestFile]\n" +
                 "\tinvoke <scripthash> <command> [optionally quoted params separated by space]\n" +
                 "Node Commands:\n" +
                 "\tshow state\n" +
@@ -670,7 +723,10 @@ namespace Neo.Shell
 
                 if (file.Length > 1024 * 1024)
                 {
-                    if (ReadUserInput($"The file '{file.FullName}' is too big, do you want to continue? (yes|no)", false)?.ToLowerInvariant() != "yes") return true;
+                    if (!ReadUserInput($"The file '{file.FullName}' is too big, do you want to continue? (yes|no)", false).IsYes())
+                    {
+                        return true;
+                    }
                 }
 
                 string[] lines = File.ReadAllLines(args[2]);
@@ -806,10 +862,12 @@ namespace Neo.Shell
                 Console.WriteLine("error");
                 return true;
             }
-            if (system.RpcServer != null &&
-                ReadUserInput("Warning: Opening the wallet with RPC turned on could result in asset loss. Are you sure you want to do this? (yes|no)", false)?.ToLowerInvariant() != "yes")
+            if (system.RpcServer != null)
             {
-                return true;
+                if (!ReadUserInput("Warning: Opening the wallet with RPC turned on could result in asset loss. Are you sure you want to do this? (yes|no)", false).IsYes())
+                {
+                    return true;
+                }
             }
             string path = args[2];
             if (!File.Exists(path))
@@ -996,20 +1054,28 @@ namespace Neo.Shell
             });
             Task task = Task.Run(async () =>
             {
+                int maxLines = 0;
+
                 while (!cancel.Token.IsCancellationRequested)
                 {
                     Console.SetCursorPosition(0, 0);
-                    WriteLineWithoutFlicker($"block: {Blockchain.Singleton.Height}/{Blockchain.Singleton.HeaderHeight}  connected: {LocalNode.Singleton.ConnectedCount}  unconnected: {LocalNode.Singleton.UnconnectedCount}");
+                    WriteLineWithoutFlicker($"block: {Blockchain.Singleton.Height}/{Blockchain.Singleton.HeaderHeight}  connected: {LocalNode.Singleton.ConnectedCount}  unconnected: {LocalNode.Singleton.UnconnectedCount}", Console.WindowWidth - 1);
+
                     int linesWritten = 1;
-                    foreach (RemoteNode node in LocalNode.Singleton.GetRemoteNodes().Take(Console.WindowHeight - 2).ToArray())
+                    foreach (RemoteNode node in LocalNode.Singleton.GetRemoteNodes().OrderByDescending(u => u.LastBlockIndex).Take(Console.WindowHeight - 2).ToArray())
                     {
-                        WriteLineWithoutFlicker(
-                            $"  ip: {node.Remote.Address}\tport: {node.Remote.Port}\tlisten: {node.ListenerTcpPort}\theight: {node.LastBlockIndex}");
+                        Console.WriteLine(
+                            $"  ip: {node.Remote.Address.ToString().PadRight(15)}\tport: {node.Remote.Port.ToString().PadRight(5)}\tlisten: {node.ListenerTcpPort.ToString().PadRight(5)}\theight: {node.LastBlockIndex.ToString().PadRight(7)}");
                         linesWritten++;
                     }
 
-                    while (++linesWritten < Console.WindowHeight)
-                        WriteLineWithoutFlicker();
+                    maxLines = Math.Max(maxLines, linesWritten);
+
+                    while (linesWritten < maxLines)
+                    {
+                        WriteLineWithoutFlicker("", Console.WindowWidth - 1);
+                        maxLines--;
+                    }
 
                     await Task.Delay(500, cancel.Token);
                 }
@@ -1061,6 +1127,10 @@ namespace Neo.Shell
                 try
                 {
                     Program.Wallet = OpenWallet(Settings.Default.UnlockWallet.Path, Settings.Default.UnlockWallet.Password);
+                }
+                catch (FileNotFoundException)
+                {
+                    Console.WriteLine($"Warning: wallet file \"{Settings.Default.UnlockWallet.Path}\" not found.");
                 }
                 catch (CryptographicException)
                 {
@@ -1238,6 +1308,11 @@ namespace Neo.Shell
 
         private static Wallet OpenWallet(string path, string password)
         {
+            if (!File.Exists(path))
+            {
+                throw new FileNotFoundException();
+            }
+
             if (Path.GetExtension(path) == ".db3")
             {
                 return UserWallet.Open(path, password);
